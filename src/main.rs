@@ -8,12 +8,17 @@ use axum::{
     Router,
 };
 use futures::{sink::SinkExt, stream::StreamExt};
+use notify::{RecursiveMode, Result};
+use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
+use std::path::Path;
+use std::sync::mpsc::channel;
 use std::{
     collections::HashSet,
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
-use tokio::sync::broadcast;
+use tokio::sync::broadcast::{self, Sender};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Our shared state
@@ -34,6 +39,17 @@ async fn main() {
 
     let user_set = Mutex::new(HashSet::new());
     let (tx, _rx) = broadcast::channel(100);
+
+    let tx2 = tx.clone();
+    tokio::spawn(async move {
+        tracing::info!("hello from thread, ready to listen to file changes :)");
+        static FILE_NAME: &str = "C:/Users/tobia/OneDrive/Desktop/db.json";
+        let path = Path::new(FILE_NAME);
+
+        if let Err(e) = watch(path, tx2) {
+            println!("error: {:?}", e)
+        }
+    });
 
     let app_state = Arc::new(AppState { user_set, tx });
 
@@ -95,8 +111,14 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     let mut send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             // In any websocket error, break loop.
-            if sender.send(Message::Text(msg)).await.is_err() {
-                break;
+            match sender.send(Message::Text(msg)).await {
+                Ok(msg) => {
+                    tracing::info!("Everything ok: {:?}", msg)
+                }
+                Err(e) => {
+                    tracing::error!("Not ok: {}", e);
+                    break;
+                }
             }
         }
     });
@@ -105,11 +127,19 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     let tx = state.tx.clone();
     let name = username.clone();
 
-    // This task will receive messages from client and send them to broadcast subscribers.
+    // This task will receive `websocket` messages from client and send them to broadcast subscribers.
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Text(text))) = receiver.next().await {
             // Add username before message.
-            let _ = tx.send(format!("{}: {}", name, text));
+            match tx.send(format!("{}: {}", name, text)) {
+                Ok(msg) => {
+                    tracing::info!("tx -> Everything ok from {}: {:?}", name, msg)
+                }
+                Err(e) => {
+                    tracing::error!("tx -> Not ok: {}", e);
+                    break;
+                }
+            }
         }
     });
 
@@ -140,4 +170,41 @@ fn check_username(state: &AppState, string: &mut String, name: &str) {
 // Include utf-8 file at **compile** time.
 async fn index() -> Html<&'static str> {
     Html(std::include_str!("../chat.html"))
+}
+
+fn watch<P: AsRef<Path>>(path: P, tx: Sender<String>) -> Result<()> {
+    let (tx1, rx1) = channel();
+
+    // Automatically select the best implementation for your platform.
+    // You can also access each implementation directly e.g. INotifyWatcher.
+    // let mut watcher = RecommendedWatcher::new(tx, Config::default().with_compare_contents(true))?;
+    let mut debouncer = new_debouncer(Duration::from_secs(1), Some(Duration::from_secs(1)), tx1)?;
+
+    // Add a path to be watched. All files and directories at that path and
+    // below will be monitored for changes.
+    // watcher.watch(path.as_ref(), RecursiveMode::NonRecursive)?;
+    debouncer
+        .watcher()
+        .watch(path.as_ref(), RecursiveMode::NonRecursive)?;
+
+    for res in rx1 {
+        match res {
+            // If there is a match execute the logevent function with the event::notify::Event as input
+            // TODO: Only check for event.kind == Any (not AnyContinous because these are fired multiple times)
+            Ok(event) => {
+                if event[0].kind == DebouncedEventKind::Any {
+                    tracing::info!("changed: {:?}", event);
+                    if let Err(e) = tx.send(String::from(format!(
+                        "File change detected: {:?}",
+                        event[0].path
+                    ))) {
+                        tracing::error!("Got a tx sending error: {}", e)
+                    }
+                }
+            }
+            Err(e) => tracing::error!("watch error: {:?}", e),
+        }
+    }
+
+    Ok(())
 }
