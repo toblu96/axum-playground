@@ -3,13 +3,16 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
+    http::StatusCode,
     response::{Html, IntoResponse},
     routing::get,
-    Router,
+    Json, Router,
 };
 use futures::{sink::SinkExt, stream::StreamExt};
+use microkv::MicroKV;
 use notify::{RecursiveMode, Result};
 use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::mpsc::channel;
 use std::{
@@ -25,6 +28,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 struct AppState {
     user_set: Mutex<HashSet<String>>,
     tx: broadcast::Sender<String>,
+    db: Arc<Mutex<MicroKV>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Identity {
+    uuid: u32,
+    name: String,
+    sensitive_data: String,
 }
 
 #[tokio::main]
@@ -40,6 +51,38 @@ async fn main() {
     let user_set = Mutex::new(HashSet::new());
     let (tx, _rx) = broadcast::channel(100);
 
+    // file db handler
+
+    // initialize in-memory database with (unsafe) cleartext password
+    let db: MicroKV = MicroKV::new("my_db").with_pwd_clear("my_password_123".to_string());
+
+    // ... or backed by disk, with auto-commit per transaction
+    let SOME_PATH = Path::new("C:/Users/tobia/OneDrive/Desktop/test").to_path_buf();
+    let db: MicroKV = MicroKV::open_with_base_path("my_db_on_disk", SOME_PATH)
+        .expect("Failed to create MicroKV from a stored file or create MicroKV for this file")
+        .set_auto_commit(true)
+        .with_pwd_clear("my_password_123".to_string());
+
+    // simple interaction to default namespace
+    let value: u64 = 12345;
+    db.put("simple", &value).expect("cannot insert in db");
+
+    let res: u64 = db.get_unwrap("simple").expect("cannot retrieve value");
+    println!("{}", res);
+    db.delete("simple").expect("cannot delete key");
+
+    // // more complex interaction to default namespace
+    // let identity = Identity {
+    //     uuid: 123,
+    //     name: String::from("Alice"),
+    //     sensitive_data: String::from("something_important_here"),
+    // };
+    // db.put("complex", identity);
+    // let stored_identity: Identity = db.get_unwrap("complex").unwrap();
+    // println!("{:?}", stored_identity);
+    // db.delete("complex");
+
+    // file change handler
     let tx2 = tx.clone();
     tokio::spawn(async move {
         tracing::info!("hello from thread, ready to listen to file changes :)");
@@ -51,10 +94,24 @@ async fn main() {
         }
     });
 
-    let app_state = Arc::new(AppState { user_set, tx });
+    let testdb = Arc::new(Mutex::new(db));
+    let otherdb = testdb.clone();
+    let app_state = Arc::new(AppState {
+        user_set,
+        tx,
+        db: testdb,
+    });
+
+    tokio::spawn(async move {
+        std::thread::sleep(Duration::from_secs(10));
+        let value: u64 = 90;
+        let _ = otherdb.lock().unwrap().put("counter", &value);
+    });
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/counter", get(counter_handler))
+        .route("/counter/reset", get(counter_reset))
         .route("/websocket", get(websocket_handler))
         .with_state(app_state);
 
@@ -207,4 +264,68 @@ fn watch<P: AsRef<Path>>(path: P, tx: Sender<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn counter_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // get db state
+    let counter = state.db.lock().unwrap().get::<u64>("counter");
+
+    // println!("Counter value: {:?}", counter.ok_or(0));
+
+    match counter {
+        Ok(counter) => {
+            println!("ok: {:?}", &counter);
+            if counter.is_none() {
+                // init value
+                let init_value: u64 = 0;
+                let _ = state.db.lock().unwrap().put("counter", &init_value);
+                Json(init_value)
+            } else {
+                // value is initalized, + 1
+                let mut value = counter.unwrap();
+                value += 1;
+                println!("new value: {}", value);
+                let _ = state.db.lock().unwrap().put("counter", &value);
+                Json(value)
+            }
+        }
+        Err(err) => {
+            println!("Error: {}", err);
+            let count: u64 = 0;
+            Json(0)
+        }
+    }
+
+    // Json(counter)
+}
+async fn counter_reset(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // get db state
+    let counter = state.db.lock().unwrap().get::<u64>("counter");
+
+    // println!("Counter value: {:?}", counter.ok_or(0));
+
+    match counter {
+        Ok(counter) => {
+            println!("ok: {:?}", &counter);
+            if counter.is_none() {
+                // init value
+                let init_value: u64 = 0;
+                let _ = state.db.lock().unwrap().put("counter", &init_value);
+                Json(init_value)
+            } else {
+                // value is initalized, + 1
+                let value = 0;
+
+                println!("new value: {}", value);
+                let _ = state.db.lock().unwrap().put("counter", &value);
+                Json(value)
+            }
+        }
+        Err(err) => {
+            println!("Error: {}", err);
+            Json(0)
+        }
+    }
+
+    // Json(counter)
 }
