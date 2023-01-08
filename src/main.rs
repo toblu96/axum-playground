@@ -54,11 +54,11 @@ async fn main() {
     // file db handler
 
     // initialize in-memory database with (unsafe) cleartext password
-    let db: MicroKV = MicroKV::new("my_db").with_pwd_clear("my_password_123".to_string());
+    // let db: MicroKV = MicroKV::new("my_db").with_pwd_clear("my_password_123".to_string());
 
     // ... or backed by disk, with auto-commit per transaction
-    let SOME_PATH = Path::new("C:/Users/tobia/OneDrive/Desktop/test").to_path_buf();
-    let db: MicroKV = MicroKV::open_with_base_path("my_db_on_disk", SOME_PATH)
+    let some_path = Path::new("C:/Users/tobia/OneDrive/Desktop/test");
+    let db: MicroKV = MicroKV::open_with_base_path("my_db_on_disk", some_path.to_path_buf())
         .expect("Failed to create MicroKV from a stored file or create MicroKV for this file")
         .set_auto_commit(true)
         .with_pwd_clear("my_password_123".to_string());
@@ -90,6 +90,16 @@ async fn main() {
         let path = Path::new(FILE_NAME);
 
         if let Err(e) = watch(path, tx2) {
+            println!("error: {:?}", e)
+        }
+    });
+
+    // check for changes in the file db
+    let tx3 = tx.clone();
+    tokio::spawn(async move {
+        let path = Path::new(&some_path);
+
+        if let Err(e) = watch(path, tx3) {
             println!("error: {:?}", e)
         }
     });
